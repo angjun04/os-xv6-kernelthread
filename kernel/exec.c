@@ -7,6 +7,8 @@
 #include "defs.h"
 #include "elf.h"
 
+extern struct proc proc[NPROC];
+
 static int loadseg(pde_t *, uint64, struct inode *, uint, uint);
 
 int flags2perm(int flags)
@@ -28,10 +30,36 @@ exec(char *path, char **argv)
   struct elfhdr elf;
   struct inode *ip;
   struct proghdr ph;
-  pagetable_t pagetable = 0, oldpagetable;
+  pagetable_t pagetable = 0;
   struct proc *p = myproc();
 
   begin_op();
+
+  for (struct proc *pp = proc; pp < &proc[NPROC]; pp++) {
+    if (pp == p)
+      continue;
+    if (pp->state == UNUSED)
+      continue;
+    if (pp->main_thread == p->main_thread) {
+      acquire(&pp->lock);
+      pp->killed = 1;
+      if (pp->state == SLEEPING)
+        pp->state = RUNNABLE;  
+      release(&pp->lock);
+    }
+  }
+
+  int alive;
+  do{
+    alive = 0;
+    for(struct proc *pp=proc; pp<&proc[NPROC];pp++){
+      if(pp == p) continue;
+      if(pp->main_thread == p->main_thread && pp->state != UNUSED && pp->state != ZOMBIE){
+        alive = 1;
+      }
+    }
+    if(alive) yield();
+  }while(alive);
 
   if((ip = namei(path)) == 0){
     end_op();
@@ -73,8 +101,6 @@ exec(char *path, char **argv)
   ip = 0;
 
   p = myproc();
-  uint64 oldsz = p->sz;
-
   // Allocate some pages at the next page boundary.
   // Make the first inaccessible as a stack guard.
   // Use the rest as the user stack.
@@ -121,12 +147,12 @@ exec(char *path, char **argv)
   safestrcpy(p->name, last, sizeof(p->name));
     
   // Commit to the user image.
-  oldpagetable = p->pagetable;
   p->pagetable = pagetable;
   p->sz = sz;
   p->trapframe->epc = elf.entry;  // initial program counter = main
   p->trapframe->sp = sp; // initial stack pointer
-  proc_freepagetable(oldpagetable, oldsz);
+  p->killed = 0;
+  p->main_thread = p;
 
   return argc; // this ends up in a0, the first argument to main(argc, argv)
 

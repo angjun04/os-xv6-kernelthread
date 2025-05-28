@@ -131,7 +131,7 @@ found:
     release(&p->lock);
     return 0;
   }
-
+  p->trapframe_va = TRAPFRAME;
   // An empty user page table.
   p->pagetable = proc_pagetable(p);
   if(p->pagetable == 0){
@@ -145,6 +145,8 @@ found:
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
+  p->main_thread = 0;
+  p->isThread = 0;
 
   return p;
 }
@@ -155,12 +157,27 @@ found:
 static void
 freeproc(struct proc *p)
 {
+  if(p->trapframe_va && p->isThread){
+    pte_t *pte = walk(p->pagetable, p->trapframe_va, 0);
+    if(pte && (*pte & PTE_V)) {
+      uvmunmap(p->pagetable, p->trapframe_va, 1, 0);
+    }
+  }
+  int target = 1;
+  for(struct proc *pp = proc; pp < &proc[NPROC]; pp++){
+    if(pp == p) continue;
+    if(pp->state == UNUSED) continue;
+    if(pp->main_thread == p->main_thread) continue;
+    target = 0;
+    break;
+  }
   if(p->trapframe)
     kfree((void*)p->trapframe);
+  if (target && p->pagetable)
+    proc_freepagetable(p->pagetable, p->sz);
+  
   p->trapframe = 0;
   p->trapframe_va = 0;
-  if(p->pagetable)
-    proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
@@ -170,6 +187,8 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  p->main_thread = 0;
+  p->isThread = 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -212,7 +231,9 @@ void
 proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
-  uvmunmap(pagetable, TRAPFRAME, 1, 0);
+  pte_t *pte = walk(pagetable, TRAPFRAME, 0);
+  if(pte && (*pte & PTE_V))
+    uvmunmap(pagetable, TRAPFRAME, 1, 0);
   uvmfree(pagetable, sz);
 }
 
@@ -262,7 +283,7 @@ growproc(int n)
 {
   uint64 sz;
   struct proc *p = myproc();
-
+  acquire(&wait_lock);
   sz = p->sz;
   if(n > 0){
     if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
@@ -271,7 +292,11 @@ growproc(int n)
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
-  p->sz = sz;
+  for(struct proc *pp = proc; pp < &proc[NPROC]; pp++)
+    if(pp->state != UNUSED && pp->pagetable == p->pagetable && pp->main_thread == p)
+      pp->sz = sz;
+
+  release(&wait_lock);
   return 0;
 }
 
@@ -317,6 +342,7 @@ fork(void)
 
   acquire(&wait_lock);
   np->parent = p;
+  np->main_thread = np;
   release(&wait_lock);
 
   acquire(&np->lock);
@@ -324,6 +350,107 @@ fork(void)
   release(&np->lock);
 
   return pid;
+}
+
+int
+clone(void(*fcn)(void*, void*), void *arg1, void *arg2, void *stack)
+{
+  int i, pid;
+  struct proc *np;
+  struct proc *p = myproc();
+  
+  if((np = allocproc()) == 0){
+    return -1;
+  }
+
+  np->pagetable = p->pagetable;
+  np->sz = p->sz;
+  
+  *(np->trapframe) = *(p->trapframe);
+  np->isThread = 1;
+  np->trapframe->epc = (uint64)fcn;
+  np->trapframe->a0 = (uint64)arg1;
+  np->trapframe->a1 = (uint64)arg2;
+  np->trapframe_va = TRAPFRAME - (np->pid * PGSIZE);
+  np->trapframe->sp = (uint64)stack + PGSIZE;
+  np->trapframe->ra = 0;
+
+  if(mappages(np->pagetable, np->trapframe_va, PGSIZE, (uint64)np->trapframe, PTE_R | PTE_W) < 0){
+    kfree((void*)np->trapframe);
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
+  np->context.sp = np->kstack + PGSIZE;
+  np->context.ra = (uint64)forkret;
+  for(i = 0; i < NOFILE; i++)
+    if(p->ofile[i])
+      np->ofile[i] = filedup(p->ofile[i]);
+  np->cwd = idup(p->cwd);
+
+  safestrcpy(np->name, p->name, sizeof(p->name));
+
+  np->main_thread =p;
+
+  pid = np->pid;
+
+  release(&np->lock);
+
+  acquire(&wait_lock);
+  np->parent = p;
+  release(&wait_lock);
+
+  acquire(&np->lock);
+  np->state = RUNNABLE;
+  release(&np->lock);
+
+  return pid;
+}
+
+int
+join(void** stack)
+{
+  struct proc *pp;
+  int havekids, pid;
+  struct proc *p = myproc();
+
+  acquire(&wait_lock);
+
+  for(;;){
+    // Scan through table looking for exited children.
+    havekids = 0;
+    for(pp = proc; pp < &proc[NPROC]; pp++){
+      if(pp->main_thread == p && pp->isThread){
+        // make sure the child isn't still in exit() or swtch().
+        acquire(&pp->lock);
+
+        havekids = 1;
+        if(pp->state == ZOMBIE){
+          uint64 stack_addr = pp->trapframe->sp - PGSIZE;
+          if(stack != 0 && copyout(pp->pagetable, (uint64)stack, (char*)&stack_addr, sizeof(uint64)) < 0) {
+            release(&pp->lock);
+            release(&wait_lock);
+            return -1;
+          }
+          pid = pp->pid;
+          freeproc(pp);
+          release(&pp->lock);
+          release(&wait_lock);
+          return pid;
+        }
+        release(&pp->lock);
+      }
+    }
+
+    // No point waiting if we don't have any children.
+    if(!havekids || killed(p)){
+      release(&wait_lock);
+      return -1;
+    }
+    
+    // Wait for a child to exit.
+    sleep(p, &wait_lock);  //DOC: wait-sleep
+  }
 }
 
 // Pass p's abandoned children to init.
@@ -372,7 +499,11 @@ exit(int status)
   reparent(p);
 
   // Parent might be sleeping in wait().
-  wakeup(p->parent);
+  if(p->isThread && p->main_thread) {
+    wakeup(p->main_thread);
+  } else {
+    wakeup(p->parent);
+  }
   
   acquire(&p->lock);
 
@@ -599,23 +730,36 @@ int
 kill(int pid)
 {
   struct proc *p;
+  struct proc *target =0;
 
   for(p = proc; p < &proc[NPROC]; p++){
     acquire(&p->lock);
     if(p->pid == pid){
-      p->killed = 1;
-      if(p->state == SLEEPING){
-        // Wake process from sleep().
-        p->state = RUNNABLE;
-      }
-      release(&p->lock);
-      return 0;
+      target = p;
+      break;
     }
     release(&p->lock);
   }
-  return -1;
-}
+  
+  if(target == 0) {
+    return -1;
+  }
 
+  int target_main_thread = target->main_thread->pid;
+  release(&target->lock);
+
+  for(struct proc *pp = proc; pp < &proc[NPROC]; pp++){
+    acquire(&pp->lock);
+    if(pp->state != UNUSED && pp->main_thread->pid == target_main_thread){
+        pp->killed = 1;
+      if(pp->state == SLEEPING) {
+        pp->state = RUNNABLE;
+      }
+    }
+    release(&pp->lock);
+  }
+  return 0;
+}
 void
 setkilled(struct proc *p)
 {
