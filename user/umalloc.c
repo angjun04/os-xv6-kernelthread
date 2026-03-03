@@ -4,7 +4,7 @@
 #include "kernel/param.h"
 
 // Memory allocator by Kernighan and Ritchie,
-// The C programming Language, 2nd ed.  Section 8.7.
+// The C Programming Language, 2nd ed.  Section 8.7.
 
 typedef long Align;
 
@@ -21,8 +21,43 @@ typedef union header Header;
 static Header base;
 static Header *freep;
 
-void
-free(void *ap)
+// Thread-safe lock using RISC-V atomic swap (amoswap)
+static volatile int malloc_lock = 0;
+
+static void
+acquire_malloc(void)
+{
+  int old;
+  for(;;){
+    asm volatile(
+      "amoswap.w.aq %0, %1, (%2)"
+      : "=r"(old)
+      : "r"(1), "r"(&malloc_lock)
+      : "memory"
+    );
+    if(old == 0)
+      break;
+    // Single CPU: must yield so lock holder can run and release
+    sleep(1);
+  }
+  asm volatile("fence rw, rw" ::: "memory");
+}
+
+static void
+release_malloc(void)
+{
+  asm volatile("fence rw, rw" ::: "memory");
+  asm volatile(
+    "amoswap.w.rl zero, %0, (%1)"
+    :
+    : "r"(0), "r"(&malloc_lock)
+    : "memory"
+  );
+}
+
+// Internal free (no lock) - called from morecore inside malloc
+static void
+_free(void *ap)
 {
   Header *bp, *p;
 
@@ -43,6 +78,14 @@ free(void *ap)
   freep = p;
 }
 
+void
+free(void *ap)
+{
+  acquire_malloc();
+  _free(ap);
+  release_malloc();
+}
+
 static Header*
 morecore(uint nu)
 {
@@ -56,7 +99,7 @@ morecore(uint nu)
     return 0;
   hp = (Header*)p;
   hp->s.size = nu;
-  free((void*)(hp + 1));
+  _free((void*)(hp + 1));
   return freep;
 }
 
@@ -65,6 +108,8 @@ malloc(uint nbytes)
 {
   Header *p, *prevp;
   uint nunits;
+
+  acquire_malloc();
 
   nunits = (nbytes + sizeof(Header) - 1)/sizeof(Header) + 1;
   if((prevp = freep) == 0){
@@ -81,10 +126,13 @@ malloc(uint nbytes)
         p->s.size = nunits;
       }
       freep = prevp;
+      release_malloc();
       return (void*)(p + 1);
     }
     if(p == freep)
-      if((p = morecore(nunits)) == 0)
+      if((p = morecore(nunits)) == 0){
+        release_malloc();
         return 0;
+      }
   }
 }

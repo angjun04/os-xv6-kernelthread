@@ -108,4 +108,5 @@ struct proc {
 
   struct proc *main_thread;
   int isThread;
+  uint64 thread_stack;
 };

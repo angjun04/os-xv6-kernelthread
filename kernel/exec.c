@@ -32,6 +32,7 @@ exec(char *path, char **argv)
   struct proghdr ph;
   pagetable_t pagetable = 0;
   struct proc *p = myproc();
+  uint64 old_trapframe_va = p->trapframe_va;  // save before proc_pagetable overwrites it
 
   begin_op();
 
@@ -146,6 +147,18 @@ exec(char *path, char **argv)
       last = s+1;
   safestrcpy(p->name, last, sizeof(p->name));
     
+  // Save old page table info before committing
+  pagetable_t oldpagetable = p->pagetable;
+  uint64 oldsz = p->sz;
+
+  // If this was a thread, unmap its trapframe from the old shared page table
+  if(p->isThread){
+    pte_t *pte = walk(oldpagetable, old_trapframe_va, 0);
+    if(pte && (*pte & PTE_V)){
+      uvmunmap(oldpagetable, old_trapframe_va, 1, 0);
+    }
+  }
+
   // Commit to the user image.
   p->pagetable = pagetable;
   p->sz = sz;
@@ -153,6 +166,23 @@ exec(char *path, char **argv)
   p->trapframe->sp = sp; // initial stack pointer
   p->killed = 0;
   p->main_thread = p;
+  p->isThread = 0;
+  p->thread_stack = 0;
+
+  // Free old page table if no other process shares it
+  {
+    int shared = 0;
+    for(struct proc *pp = proc; pp < &proc[NPROC]; pp++){
+      if(pp == p) continue;
+      if(pp->state == UNUSED) continue;
+      if(pp->pagetable == oldpagetable){
+        shared = 1;
+        break;
+      }
+    }
+    if(!shared)
+      proc_freepagetable(oldpagetable, oldsz);
+  }
 
   return argc; // this ends up in a0, the first argument to main(argc, argv)
 

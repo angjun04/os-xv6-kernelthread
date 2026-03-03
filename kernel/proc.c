@@ -147,6 +147,7 @@ found:
   p->context.sp = p->kstack + PGSIZE;
   p->main_thread = 0;
   p->isThread = 0;
+  p->thread_stack = 0;
 
   return p;
 }
@@ -167,9 +168,10 @@ freeproc(struct proc *p)
   for(struct proc *pp = proc; pp < &proc[NPROC]; pp++){
     if(pp == p) continue;
     if(pp->state == UNUSED) continue;
-    if(pp->main_thread == p->main_thread) continue;
-    target = 0;
-    break;
+    if(pp->pagetable == p->pagetable){
+      target = 0;
+      break;
+    }
   }
   if(p->trapframe)
     kfree((void*)p->trapframe);
@@ -189,6 +191,7 @@ freeproc(struct proc *p)
   p->state = UNUSED;
   p->main_thread = 0;
   p->isThread = 0;
+  p->thread_stack = 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -287,13 +290,14 @@ growproc(int n)
   sz = p->sz;
   if(n > 0){
     if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
+      release(&wait_lock);
       return -1;
     }
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
   for(struct proc *pp = proc; pp < &proc[NPROC]; pp++)
-    if(pp->state != UNUSED && pp->pagetable == p->pagetable && pp->main_thread == p)
+    if(pp->state != UNUSED && pp->pagetable == p->pagetable)
       pp->sz = sz;
 
   release(&wait_lock);
@@ -363,9 +367,12 @@ clone(void(*fcn)(void*, void*), void *arg1, void *arg2, void *stack)
     return -1;
   }
 
+  // Free the temporary page table created by allocproc (we use parent's instead)
+  proc_freepagetable(np->pagetable, 0);
   np->pagetable = p->pagetable;
   np->sz = p->sz;
-  
+  np->thread_stack = (uint64)stack;
+
   *(np->trapframe) = *(p->trapframe);
   np->isThread = 1;
   np->trapframe->epc = (uint64)fcn;
@@ -426,7 +433,7 @@ join(void** stack)
 
         havekids = 1;
         if(pp->state == ZOMBIE){
-          uint64 stack_addr = pp->trapframe->sp - PGSIZE;
+          uint64 stack_addr = pp->thread_stack;
           if(stack != 0 && copyout(pp->pagetable, (uint64)stack, (char*)&stack_addr, sizeof(uint64)) < 0) {
             release(&pp->lock);
             release(&wait_lock);
