@@ -1,6 +1,7 @@
 # Project 02: xv6 Kernel Thread Implementation
 
 > HYU ELE3021 Operating Systems - 2023071212
+> 강수용 교수님의 강의(성준모 조교님)을 수강하며 학습한 내용을 정리하였습니다.
 
 ---
 
